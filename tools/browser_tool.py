@@ -1237,6 +1237,24 @@ def _extract_screenshot_path_from_text(text: str) -> Optional[str]:
     return None
 
 
+def _is_sandbox_error(stderr: str, parsed_result: Optional[Dict[str, Any]]) -> bool:
+    """Detect Chrome sandbox failures from stderr or parsed agent-browser output."""
+    text = (stderr or "").lower()
+    if parsed_result and isinstance(parsed_result, dict):
+        err = str(parsed_result.get("error", "")).lower()
+        text = f"{text} {err}"
+    indicators = (
+        "no usable sandbox",
+        "chrome exited early",
+        "sandbox",
+        "apparmor",
+        "namespace",
+        "the suid sandbox helper",
+        "operation not permitted",
+    )
+    return any(ind in text for ind in indicators)
+
+
 def _run_browser_command(
     task_id: str,
     command: str,
@@ -1245,21 +1263,26 @@ def _run_browser_command(
 ) -> Dict[str, Any]:
     """
     Run an agent-browser CLI command using our pre-created Browserbase session.
-    
+
+    Automatically retries with ``--no-sandbox`` when Chrome fails due to
+    sandbox/AppArmor restrictions (common in containers and locked-down Linux
+    hosts).  This prevents the LLM from getting stuck in a loop trying to
+    manually pass Chrome args.
+
     Args:
         task_id: Task identifier to get the right session
         command: The command to run (e.g., "open", "click")
         args: Additional arguments for the command
         timeout: Command timeout in seconds.  ``None`` reads
                  ``browser.command_timeout`` from config (default 30s).
-        
+
     Returns:
         Parsed JSON response from agent-browser
     """
     if timeout is None:
         timeout = _get_command_timeout()
     args = args or []
-    
+
     # Build the command
     try:
         browser_cmd = _find_agent_browser()
@@ -1271,7 +1294,7 @@ def _run_browser_command(
         error = _termux_browser_install_error()
         logger.warning("browser command blocked on Termux: %s", error)
         return {"success": False, "error": error}
-    
+
     from tools.interrupt import is_interrupted
     if is_interrupted():
         return {"success": False, "error": "Interrupted"}
@@ -1282,7 +1305,7 @@ def _run_browser_command(
     except Exception as e:
         logger.warning("Failed to create browser session for task=%s: %s", task_id, e)
         return {"success": False, "error": f"Failed to create browser session: {str(e)}"}
-    
+
     # Build the command with the appropriate backend flag.
     # Cloud mode: --cdp <websocket_url> connects to Browserbase.
     # Local mode: --session <name> launches a local headless Chromium.
@@ -1304,155 +1327,205 @@ def _run_browser_command(
         "--json",
         command
     ] + args
-    
-    try:
-        # Give each task its own socket directory to prevent concurrency conflicts.
-        # Without this, parallel workers fight over the same default socket path,
-        # causing "Failed to create socket directory: Permission denied" errors.
-        task_socket_dir = os.path.join(
-            _socket_safe_tmpdir(),
-            f"agent-browser-{session_info['session_name']}"
-        )
-        os.makedirs(task_socket_dir, mode=0o700, exist_ok=True)
-        # Record this hermes PID as the session owner (cross-process safe
-        # orphan detection — see _write_owner_pid).
-        _write_owner_pid(task_socket_dir, session_info['session_name'])
-        logger.debug("browser cmd=%s task=%s socket_dir=%s (%d chars)",
-                     command, task_id, task_socket_dir, len(task_socket_dir))
-        
-        browser_env = {**os.environ}
 
-        # Ensure subprocesses inherit the same browser-specific PATH fallbacks
-        # used during CLI discovery.
-        browser_env["PATH"] = _merge_browser_path(browser_env.get("PATH", ""))
-        browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
+    # ------------------------------------------------------------------
+    # Core execution — may be retried once with --no-sandbox on sandbox
+    # failures (local mode only).
+    # ------------------------------------------------------------------
+    _sandbox_retry_done = False
 
-        # Tell the agent-browser daemon to self-terminate after being idle
-        # for our configured inactivity timeout.  This is the daemon-side
-        # counterpart to our Python-side _cleanup_inactive_browser_sessions
-        # — the daemon kills itself and its Chrome children when no CLI
-        # commands arrive within the window.  Added in agent-browser 0.24.
-        if "AGENT_BROWSER_IDLE_TIMEOUT_MS" not in browser_env:
-            idle_ms = str(BROWSER_SESSION_INACTIVITY_TIMEOUT * 1000)
-            browser_env["AGENT_BROWSER_IDLE_TIMEOUT_MS"] = idle_ms
-
-        # Pass through any configured custom Chrome launch arguments
-        # (e.g. --no-sandbox for container/VM environments).  Merges
-        # config.yaml browser.chrome_args with the AGENT_BROWSER_ARGS
-        # env var so both sources are respected.
-        chrome_args = _get_chrome_args()
-        if chrome_args:
-            browser_env["AGENT_BROWSER_ARGS"] = chrome_args
-        
-        # Use temp files for stdout/stderr instead of pipes.
-        # agent-browser starts a background daemon that inherits file
-        # descriptors.  With capture_output=True (pipes), the daemon keeps
-        # the pipe fds open after the CLI exits, so communicate() never
-        # sees EOF and blocks until the timeout fires.
-        stdout_path = os.path.join(task_socket_dir, f"_stdout_{command}")
-        stderr_path = os.path.join(task_socket_dir, f"_stderr_{command}")
-        stdout_fd = os.open(stdout_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        stderr_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    while True:
         try:
-            proc = subprocess.Popen(
-                cmd_parts,
-                stdout=stdout_fd,
-                stderr=stderr_fd,
-                stdin=subprocess.DEVNULL,
-                env=browser_env,
+            # Give each task its own socket directory to prevent concurrency conflicts.
+            # Without this, parallel workers fight over the same default socket path,
+            # causing "Failed to create socket directory: Permission denied" errors.
+            task_socket_dir = os.path.join(
+                _socket_safe_tmpdir(),
+                f"agent-browser-{session_info['session_name']}"
             )
-        finally:
-            os.close(stdout_fd)
-            os.close(stderr_fd)
+            os.makedirs(task_socket_dir, mode=0o700, exist_ok=True)
+            # Record this hermes PID as the session owner (cross-process safe
+            # orphan detection — see _write_owner_pid).
+            _write_owner_pid(task_socket_dir, session_info['session_name'])
+            logger.debug("browser cmd=%s task=%s socket_dir=%s (%d chars)",
+                         command, task_id, task_socket_dir, len(task_socket_dir))
 
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-            logger.warning("browser '%s' timed out after %ds (task=%s, socket_dir=%s)",
-                           command, timeout, task_id, task_socket_dir)
-            return {"success": False, "error": f"Command timed out after {timeout} seconds"}
+            browser_env = {**os.environ}
 
-        with open(stdout_path, "r") as f:
-            stdout = f.read()
-        with open(stderr_path, "r") as f:
-            stderr = f.read()
-        returncode = proc.returncode
+            # Ensure subprocesses inherit the same browser-specific PATH fallbacks
+            # used during CLI discovery.
+            browser_env["PATH"] = _merge_browser_path(browser_env.get("PATH", ""))
+            browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
 
-        # Clean up temp files (best-effort)
-        for p in (stdout_path, stderr_path):
+            # Tell the agent-browser daemon to self-terminate after being idle
+            # for our configured inactivity timeout.  This is the daemon-side
+            # counterpart to our Python-side _cleanup_inactive_browser_sessions
+            # — the daemon kills itself and its Chrome children when no CLI
+            # commands arrive within the window.  Added in agent-browser 0.24.
+            if "AGENT_BROWSER_IDLE_TIMEOUT_MS" not in browser_env:
+                idle_ms = str(BROWSER_SESSION_INACTIVITY_TIMEOUT * 1000)
+                browser_env["AGENT_BROWSER_IDLE_TIMEOUT_MS"] = idle_ms
+
+            # Pass through any configured custom Chrome launch arguments
+            # (e.g. --no-sandbox for container/VM environments).  Merges
+            # config.yaml browser.chrome_args with the AGENT_BROWSER_ARGS
+            # env var so both sources are respected.
+            chrome_args = _get_chrome_args()
+            if _sandbox_retry_done:
+                # Force --no-sandbox on retry (append if not already present).
+                if "--no-sandbox" not in chrome_args:
+                    chrome_args = f"{chrome_args},--no-sandbox" if chrome_args else "--no-sandbox"
+            if chrome_args:
+                browser_env["AGENT_BROWSER_ARGS"] = chrome_args
+
+            # Use temp files for stdout/stderr instead of pipes.
+            # agent-browser starts a background daemon that inherits file
+            # descriptors.  With capture_output=True (pipes), the daemon keeps
+            # the pipe fds open after the CLI exits, so communicate() never
+            # sees EOF and blocks until the timeout fires.
+            stdout_path = os.path.join(task_socket_dir, f"_stdout_{command}")
+            stderr_path = os.path.join(task_socket_dir, f"_stderr_{command}")
+            stdout_fd = os.open(stdout_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            stderr_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             try:
-                os.unlink(p)
-            except OSError:
-                pass
+                proc = subprocess.Popen(
+                    cmd_parts,
+                    stdout=stdout_fd,
+                    stderr=stderr_fd,
+                    stdin=subprocess.DEVNULL,
+                    env=browser_env,
+                )
+            finally:
+                os.close(stdout_fd)
+                os.close(stderr_fd)
 
-        # Log stderr for diagnostics — use warning level on failure so it's visible
-        if stderr and stderr.strip():
-            level = logging.WARNING if returncode != 0 else logging.DEBUG
-            logger.log(level, "browser '%s' stderr: %s", command, stderr.strip()[:500])
-        
-        stdout_text = stdout.strip()
-
-        # Empty output with rc=0 is a broken state — treat as failure rather
-        # than silently returning {"success": True, "data": {}}.
-        # Some commands (close, record) legitimately return no output.
-        if not stdout_text and returncode == 0 and command not in _EMPTY_OK_COMMANDS:
-            logger.warning("browser '%s' returned empty output (rc=0)", command)
-            return {"success": False, "error": f"Browser command '{command}' returned no output"}
-
-        if stdout_text:
             try:
-                parsed = json.loads(stdout_text)
-                # Warn if snapshot came back empty (common sign of daemon/CDP issues)
-                if command == "snapshot" and parsed.get("success"):
-                    snap_data = parsed.get("data", {})
-                    if not snap_data.get("snapshot") and not snap_data.get("refs"):
-                        logger.warning("snapshot returned empty content. "
-                                       "Possible stale daemon or CDP connection issue. "
-                                       "returncode=%s", returncode)
-                return parsed
-            except json.JSONDecodeError:
-                raw = stdout_text[:2000]
-                logger.warning("browser '%s' returned non-JSON output (rc=%s): %s",
-                               command, returncode, raw[:500])
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                logger.warning("browser '%s' timed out after %ds (task=%s, socket_dir=%s)",
+                               command, timeout, task_id, task_socket_dir)
+                return {"success": False, "error": f"Command timed out after {timeout} seconds"}
 
-                if command == "screenshot":
-                    stderr_text = (stderr or "").strip()
-                    combined_text = "\n".join(
-                        part for part in [stdout_text, stderr_text] if part
-                    )
-                    recovered_path = _extract_screenshot_path_from_text(combined_text)
+            with open(stdout_path, "r") as f:
+                stdout = f.read()
+            with open(stderr_path, "r") as f:
+                stderr = f.read()
+            returncode = proc.returncode
 
-                    if recovered_path and Path(recovered_path).exists():
-                        logger.info(
-                            "browser 'screenshot' recovered file from non-JSON output: %s",
-                            recovered_path,
+            # Clean up temp files (best-effort)
+            for p in (stdout_path, stderr_path):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+            # Log stderr for diagnostics — use warning level on failure so it's visible
+            if stderr and stderr.strip():
+                level = logging.WARNING if returncode != 0 else logging.DEBUG
+                logger.log(level, "browser '%s' stderr: %s", command, stderr.strip()[:500])
+
+            stdout_text = stdout.strip()
+
+            # Empty output with rc=0 is a broken state — treat as failure rather
+            # than silently returning {"success": True, "data": {}}.
+            # Some commands (close, record) legitimately return no output.
+            if not stdout_text and returncode == 0 and command not in _EMPTY_OK_COMMANDS:
+                logger.warning("browser '%s' returned empty output (rc=0)", command)
+                return {"success": False, "error": f"Browser command '{command}' returned no output"}
+
+            parsed_result = None
+            if stdout_text:
+                try:
+                    parsed_result = json.loads(stdout_text)
+                    # Warn if snapshot came back empty (common sign of daemon/CDP issues)
+                    if command == "snapshot" and parsed_result.get("success"):
+                        snap_data = parsed_result.get("data", {})
+                        if not snap_data.get("snapshot") and not snap_data.get("refs"):
+                            logger.warning("snapshot returned empty content. "
+                                           "Possible stale daemon or CDP connection issue. "
+                                           "returncode=%s", returncode)
+                    return parsed_result
+                except json.JSONDecodeError:
+                    raw = stdout_text[:2000]
+                    logger.warning("browser '%s' returned non-JSON output (rc=%s): %s",
+                                   command, returncode, raw[:500])
+
+                    if command == "screenshot":
+                        stderr_text = (stderr or "").strip()
+                        combined_text = "\n".join(
+                            part for part in [stdout_text, stderr_text] if part
                         )
-                        return {
-                            "success": True,
-                            "data": {
-                                "path": recovered_path,
-                                "raw": raw,
-                            },
-                        }
+                        recovered_path = _extract_screenshot_path_from_text(combined_text)
 
-                return {
-                    "success": False,
-                    "error": f"Non-JSON output from agent-browser for '{command}': {raw}"
-                }
-        
-        # Check for errors
-        if returncode != 0:
-            error_msg = stderr.strip() if stderr else f"Command failed with code {returncode}"
-            logger.warning("browser '%s' failed (rc=%s): %s", command, returncode, error_msg[:300])
-            return {"success": False, "error": error_msg}
-        
-        return {"success": True, "data": {}}
-        
-    except Exception as e:
-        logger.warning("browser '%s' exception: %s", command, e, exc_info=True)
-        return {"success": False, "error": str(e)}
+                        if recovered_path and Path(recovered_path).exists():
+                            logger.info(
+                                "browser 'screenshot' recovered file from non-JSON output: %s",
+                                recovered_path,
+                            )
+                            return {
+                                "success": True,
+                                "data": {
+                                    "path": recovered_path,
+                                    "raw": raw,
+                                },
+                            }
+
+                    return {
+                        "success": False,
+                        "error": f"Non-JSON output from agent-browser for '{command}': {raw}"
+                    }
+
+            # Check for errors
+            if returncode != 0:
+                error_msg = stderr.strip() if stderr else f"Command failed with code {returncode}"
+                logger.warning("browser '%s' failed (rc=%s): %s", command, returncode, error_msg[:300])
+                return {"success": False, "error": error_msg}
+
+            return {"success": True, "data": {}}
+
+        except Exception as e:
+            logger.warning("browser '%s' exception: %s", command, e, exc_info=True)
+            return {"success": False, "error": str(e)}
+
+        # ------------------------------------------------------------------
+        # Sandbox retry logic: if we see a sandbox failure in local mode,
+        # kill the daemon and retry once with --no-sandbox appended.
+        # ------------------------------------------------------------------
+        if session_info.get("cdp_url"):
+            # Cloud/CDP mode — sandbox retry doesn't apply
+            break
+
+        if _sandbox_retry_done:
+            break
+
+        if _is_sandbox_error(stderr, parsed_result):
+            logger.warning(
+                "Browser sandbox error detected for task=%s. "
+                "Killing daemon and retrying with --no-sandbox.",
+                task_id,
+            )
+            _sandbox_retry_done = True
+
+            # Kill the daemon so the retry starts a fresh one with new args
+            pid_file = os.path.join(task_socket_dir, f"{session_info['session_name']}.pid")
+            if os.path.isfile(pid_file):
+                try:
+                    daemon_pid = int(Path(pid_file).read_text().strip())
+                    os.kill(daemon_pid, signal.SIGTERM)
+                    logger.debug("Killed sandbox-failed daemon pid %s for retry", daemon_pid)
+                except (ProcessLookupError, ValueError, PermissionError, OSError):
+                    pass
+
+            # Remove the socket dir so the daemon doesn't reuse stale state
+            shutil.rmtree(task_socket_dir, ignore_errors=True)
+
+            # Loop back for one retry
+            continue
+
+        # Not a sandbox error — return the result we got
+        break
 
 
 def _extract_relevant_content(
