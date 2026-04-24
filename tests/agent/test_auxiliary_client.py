@@ -1203,3 +1203,44 @@ class TestAnthropicCompatImageConversion:
         }]
         result = _convert_openai_images_to_anthropic(messages)
         assert result[0]["content"][0]["source"]["media_type"] == "image/jpeg"
+
+
+class TestKimiCodingAuxiliaryHeaders:
+    """Auxiliary client must set Coding-Agent headers for Kimi /coding endpoint."""
+
+    def test_resolve_provider_client_sets_kimi_coding_headers(self):
+        from agent.auxiliary_client import resolve_provider_client
+
+        with patch(
+            "hermes_cli.auth.resolve_api_key_provider_credentials"
+        ) as mock_creds:
+            mock_creds.return_value = {
+                "api_key": "sk-kimi-test",
+                "base_url": "https://api.kimi.com/coding/v1",
+            }
+            client, model = resolve_provider_client(
+                provider="kimi-coding",
+                model="kimi-for-coding",
+            )
+
+        headers = client.default_headers
+        assert headers["User-Agent"] == "claude-code/0.1.0"
+        assert headers["X-Client-Name"] == "kimi-cli"
+
+    def test_non_kimi_provider_does_not_set_kimi_headers(self):
+        from agent.auxiliary_client import resolve_provider_client
+
+        with patch(
+            "hermes_cli.auth.resolve_api_key_provider_credentials"
+        ) as mock_creds:
+            mock_creds.return_value = {
+                "api_key": "sk-test",
+                "base_url": "https://api.minimax.io/anthropic",
+            }
+            client, model = resolve_provider_client(
+                provider="minimax",
+                model="MiniMax-M2.7",
+            )
+
+        headers = client.default_headers
+        assert "X-Client-Name" not in headers
