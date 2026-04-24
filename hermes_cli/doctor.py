@@ -960,6 +960,7 @@ def run_doctor(args):
                 _headers = {"Authorization": f"Bearer {_key}"}
                 if base_url_host_matches(_base, "api.kimi.com"):
                     _headers["User-Agent"] = "claude-code/0.1.0"
+                    _headers["X-Client-Name"] = "kimi-cli"
                 _resp = httpx.get(
                     _url,
                     headers=_headers,
