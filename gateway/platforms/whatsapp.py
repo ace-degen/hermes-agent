@@ -397,32 +397,14 @@ class WhatsAppAdapter(BasePlatformAdapter):
             # Ensure session directory exists
             self._session_path.mkdir(parents=True, exist_ok=True)
             
-            # Check if bridge is already running and connected
-            import aiohttp
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        f"http://127.0.0.1:{self._bridge_port}/health",
-                        timeout=aiohttp.ClientTimeout(total=2)
-                    ) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            bridge_status = data.get("status", "unknown")
-                            if bridge_status == "connected":
-                                print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
-                                self._mark_connected()
-                                self._bridge_process = None  # Not managed by us
-                                self._http_session = aiohttp.ClientSession()
-                                self._poll_task = asyncio.create_task(self._poll_messages())
-                                return True
-                            else:
-                                print(f"[{self.name}] Bridge found but not connected (status: {bridge_status}), restarting")
-            except Exception:
-                pass  # Bridge not running, start a new one
-            
-            # Kill any orphaned bridge from a previous gateway run
+            # Kill any existing bridge from a previous gateway run.
+            # NEVER adopt an existing bridge — orphaned bridges have stale
+            # state, stuck message queues, and corrupt session files.
+            # Using --replace or systemd restart kills the gateway but NOT
+            # the bridge (it runs in its own process group via os.setsid).
+            # Adopting these zombies causes a death spiral of disconnects.
             _kill_port_process(self._bridge_port)
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
             
             # Start the bridge process in its own process group.
             # Route output to a log file so QR codes, errors, and reconnection
@@ -580,8 +562,10 @@ class WhatsAppAdapter(BasePlatformAdapter):
             except Exception as e:
                 print(f"[{self.name}] Error stopping bridge: {e}")
         else:
-            # Bridge was not started by us, don't kill it
-            print(f"[{self.name}] Disconnecting (external bridge left running)")
+            # Bridge was adopted (not started by us). Still kill it — orphaned
+            # bridges survive gateway restarts and poison the next startup.
+            print(f"[{self.name}] Killing adopted bridge on port {self._bridge_port}")
+            _kill_port_process(self._bridge_port)
 
         # Cancel the poll task explicitly
         if self._poll_task and not self._poll_task.done():

@@ -83,11 +83,8 @@ def _mock_aiohttp(status=200, json_data=None, json_side_effect=None):
 
 
 def _connect_patches(mock_proc, mock_fh, mock_client_cls=None):
-    """Return a dict of common patches needed to reach the health-check loop."""
-    patches = {
-        "gateway.platforms.whatsapp.check_whatsapp_requirements": True,
-        "gateway.platforms.whatsapp.asyncio.create_task": MagicMock(),
-    }
+    """Return a list of common patches needed to reach the health-check loop."""
+    from gateway.platforms.whatsapp import WhatsAppAdapter
     base = [
         patch("gateway.platforms.whatsapp.check_whatsapp_requirements", return_value=True),
         patch.object(Path, "exists", return_value=True),
@@ -97,9 +94,13 @@ def _connect_patches(mock_proc, mock_fh, mock_client_cls=None):
         patch("builtins.open", return_value=mock_fh),
         patch("gateway.platforms.whatsapp.asyncio.sleep", new_callable=AsyncMock),
         patch("gateway.platforms.whatsapp.asyncio.create_task"),
+        patch.object(WhatsAppAdapter, "_acquire_platform_lock", return_value=True),
     ]
     if mock_client_cls is not None:
         base.append(patch("aiohttp.ClientSession", mock_client_cls))
+    else:
+        # Default: health endpoint returns connected so Phase 2 succeeds
+        base.append(patch("aiohttp.ClientSession", _mock_aiohttp(status=200, json_data={"status": "connected"})))
     return base
 
 
@@ -173,7 +174,7 @@ class TestDataInitialized:
         patches = _connect_patches(mock_proc, mock_fh, mock_client_cls)
 
         with patches[0], patches[1], patches[2], patches[3], patches[4], \
-             patches[5], patches[6], patches[7], patches[8], \
+             patches[5], patches[6], patches[7], patches[8], patches[9], \
              patch.object(type(adapter), "_poll_messages", return_value=MagicMock()):
             # Must NOT raise NameError
             result = await adapter.connect()
@@ -203,7 +204,7 @@ class TestFileHandleClosedOnError:
         patches = _connect_patches(mock_proc, mock_fh)
 
         with patches[0], patches[1], patches[2], patches[3], patches[4], \
-             patches[5], patches[6], patches[7]:
+             patches[5], patches[6], patches[7], patches[8], patches[9]:
             result = await adapter.connect()
 
         assert result is False
@@ -551,3 +552,101 @@ class TestHttpSessionLifecycle:
 
         mock_task.cancel.assert_not_called()
         assert adapter._poll_task is None
+
+
+# ---------------------------------------------------------------------------
+# Bridge zombie / adoption death spiral (issue #432, PR #13270 follow-up)
+# ---------------------------------------------------------------------------
+
+class TestBridgeZombieDeathSpiral:
+    """Verify orphaned bridges are killed, never adopted."""
+
+    @pytest.mark.asyncio
+    async def test_connect_never_adopts_existing_bridge(self):
+        """If a bridge is already listening on the port, kill it and start fresh."""
+        adapter = _make_adapter()
+
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None  # new bridge stays alive
+        mock_fh = MagicMock()
+
+        # Health endpoint returns connected so Phase 2 succeeds immediately
+        mock_client_cls = _mock_aiohttp(status=200, json_data={"status": "connected"})
+        patches = _connect_patches(mock_proc, mock_fh, mock_client_cls)
+
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patches[5], patches[6], patches[7], patches[8], patches[9], \
+             patch("gateway.platforms.whatsapp._kill_port_process") as mock_kill:
+            result = await adapter.connect()
+
+        assert result is True
+        # Must kill any pre-existing bridge before starting a new one
+        mock_kill.assert_called_once_with(adapter._bridge_port)
+        # Must own the new bridge process
+        assert adapter._bridge_process is mock_proc
+        assert adapter._bridge_process is not None
+
+    @pytest.mark.asyncio
+    async def test_disconnect_kills_adopted_bridge(self):
+        """If _bridge_process is None (adopted), disconnect() must still kill it."""
+        adapter = _make_adapter()
+        adapter._bridge_process = None  # simulate adopted bridge
+        adapter._poll_task = None
+        adapter._http_session = None
+        adapter._running = True
+        adapter._session_lock_identity = None
+
+        with patch("gateway.platforms.whatsapp._kill_port_process") as mock_kill:
+            await adapter.disconnect()
+
+        mock_kill.assert_called_once_with(adapter._bridge_port)
+
+    @pytest.mark.asyncio
+    async def test_disconnect_kills_managed_bridge_via_terminate(self):
+        """Managed bridge: use graceful terminate → force kill path."""
+        adapter = _make_adapter()
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None  # still alive after terminate
+        adapter._bridge_process = mock_proc
+        adapter._poll_task = None
+        adapter._http_session = None
+        adapter._running = True
+        adapter._session_lock_identity = None
+
+        with patch("gateway.platforms.whatsapp._terminate_bridge_process") as mock_term, \
+             patch("gateway.platforms.whatsapp.asyncio.sleep", new_callable=AsyncMock):
+            await adapter.disconnect()
+
+        # First call: graceful, second call: force
+        assert mock_term.call_count == 2
+        mock_term.assert_any_call(mock_proc, force=False)
+        mock_term.assert_any_call(mock_proc, force=True)
+
+    @pytest.mark.asyncio
+    async def test_no_zombie_accumulation_across_restarts(self):
+        """Simulate two connect() calls: each must kill the previous bridge."""
+        adapter = _make_adapter()
+
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_fh = MagicMock()
+
+        # Health endpoint returns connected so Phase 2 succeeds immediately
+        mock_client_cls = _mock_aiohttp(status=200, json_data={"status": "connected"})
+        patches = _connect_patches(mock_proc, mock_fh, mock_client_cls)
+
+        kill_calls = []
+
+        def track_kill(port):
+            kill_calls.append(port)
+
+        # Patch _kill_port_process at module level, not inside _connect_patches
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patches[5], patches[6], patches[7], patches[8], \
+             patch("gateway.platforms.whatsapp._kill_port_process") as mock_kill:
+            await adapter.connect()
+            await adapter.connect()
+
+        # Each connect() must kill the port before starting a new bridge
+        assert mock_kill.call_count == 2
+        mock_kill.assert_any_call(adapter._bridge_port)
